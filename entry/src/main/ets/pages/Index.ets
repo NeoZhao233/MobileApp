@@ -1,5 +1,7 @@
 type CompactPanel = 'library' | 'graph';
 
+const NOTES_STORAGE_KEY: string = 'obsidian_lite_notes_json';
+
 type InlineTokenKind = 'text' | 'bold' | 'code' | 'link';
 
 interface InlineToken {
@@ -20,6 +22,18 @@ interface GraphEdge {
   fromTitle: string;
   toId?: string;
   toTitle: string;
+}
+
+interface GraphNodePoint {
+  x: number;
+  y: number;
+}
+
+interface GraphPhysicsNode {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
 }
 
 interface ThemeTokens {
@@ -101,6 +115,7 @@ const SAMPLE_NOTES: Note[] = [
 @Component
 struct Index {
   @State notes: Note[] = SAMPLE_NOTES;
+  @Watch('onActiveNoteIdChanged')
   @State activeNoteId: string = SAMPLE_NOTES[0].id;
   @State searchText: string = '';
   @State activeTag: string = '';
@@ -114,6 +129,214 @@ struct Index {
   @State draftTagsText: string = '';
   @State isNoteEditing: boolean = false;
   @State showSelectedNoteInCompact: boolean = false;
+  @State previewBodySnapshot: string = SAMPLE_NOTES[0].body;
+  @State graphZoom: number = 1;
+  @State graphFocusedNoteId: string = '';
+  @State graphNodePositions: Record<string, GraphNodePoint> = {};
+  @State graphPanBase: GraphNodePoint = { x: -600, y: -600 };
+  @State graphPanOffset: GraphNodePoint = { x: 0, y: 0 };
+  @State draggingNodeId: string = '';
+  @State draggingNodeOffset: GraphNodePoint = { x: 0, y: 0 };
+  @State isDraggingNode: boolean = false;
+  private physicsNodes: Record<string, GraphPhysicsNode> = {};
+  private physicsTimer: number = -1;
+  private physicsAlpha: number = 0;
+  private dragStartX: number = 0;
+  private dragStartY: number = 0;
+
+  aboutToAppear(): void {
+    this.initializeNotesStorage();
+    this.loadNotesFromStorage();
+  }
+
+  private startPhysics(): void {
+    if (this.physicsTimer !== -1) {
+      clearInterval(this.physicsTimer);
+    }
+    this.physicsAlpha = 1;
+    this.physicsTimer = setInterval(() => {
+      this.physicsTick();
+    }, 16);
+  }
+
+  private wakePhysics(): void {
+    if (this.physicsTimer === -1 || this.physicsAlpha < 0.1) {
+      this.startPhysics();
+    } else {
+      this.physicsAlpha = 1;
+    }
+  }
+
+  private physicsTick(): void {
+    if (this.physicsAlpha < 0.001) {
+      clearInterval(this.physicsTimer);
+      this.physicsTimer = -1;
+      return;
+    }
+
+    let totalVelocity = 0;
+    const edges = this.getGraphEdges();
+
+    this.notes.forEach(n1 => {
+      this.notes.forEach(n2 => {
+        if (n1.id === n2.id) {
+          return;
+        }
+        const p1 = this.physicsNodes[n1.id];
+        const p2 = this.physicsNodes[n2.id];
+        if (!p1 || !p2) return;
+
+        const dx = p1.x - p2.x;
+        const dy = p1.y - p2.y;
+        let d = Math.sqrt(dx * dx + dy * dy);
+        if (d === 0) { d = 0.1; }
+        
+        if (d < 500) {
+          const force = 4000 / (d * d);
+          p1.vx += (dx / d) * force * this.physicsAlpha;
+          p1.vy += (dy / d) * force * this.physicsAlpha;
+        }
+      });
+    });
+
+    edges.forEach(edge => {
+      const p1 = this.physicsNodes[edge.fromId];
+      const p2 = this.physicsNodes[edge.toId || ''];
+      if (!p1 || !p2) {
+        return;
+      }
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      let d = Math.sqrt(dx * dx + dy * dy);
+      if (d === 0) { d = 0.1; }
+      
+      const force = (d - 120) * 0.05;
+      p1.vx += (dx / d) * force * this.physicsAlpha;
+      p1.vy += (dy / d) * force * this.physicsAlpha;
+      p2.vx -= (dx / d) * force * this.physicsAlpha;
+      p2.vy -= (dy / d) * force * this.physicsAlpha;
+    });
+
+    this.notes.forEach(n1 => {
+      const p1 = this.physicsNodes[n1.id];
+      if (!p1) return;
+
+      const dx = 1000 - p1.x;
+      const dy = 1000 - p1.y;
+      let d = Math.sqrt(dx * dx + dy * dy);
+      if (d === 0) { d = 0.1; }
+      
+      p1.vx += (dx / d) * (d * 0.005) * this.physicsAlpha;
+      p1.vy += (dy / d) * (d * 0.005) * this.physicsAlpha;
+
+      if (this.draggingNodeId === n1.id) {
+        p1.vx = 0;
+        p1.vy = 0;
+      } else {
+        p1.vx *= 0.85;
+        p1.vy *= 0.85;
+        p1.x += p1.vx;
+        p1.y += p1.vy;
+      }
+
+      totalVelocity += Math.abs(p1.vx) + Math.abs(p1.vy);
+    });
+
+    this.physicsAlpha *= 0.98;
+
+    const nextPos: Record<string, GraphNodePoint> = {};
+    const keys = Object.keys(this.physicsNodes);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const nd = this.physicsNodes[k];
+      nextPos[k] = { x: nd.x, y: nd.y };
+    }
+    this.graphNodePositions = nextPos;
+  }
+
+  private initForceDirectedLayout(): void {
+    if (Object.keys(this.graphNodePositions).length === this.notes.length && Object.keys(this.physicsNodes).length === this.notes.length) {
+      this.wakePhysics();
+      return;
+    }
+    
+    this.notes.forEach(n => {
+      if (!this.physicsNodes[n.id]) {
+        this.physicsNodes[n.id] = {
+          x: 1000 + (Math.random() * 400 - 200),
+          y: 1000 + (Math.random() * 400 - 200),
+          vx: 0,
+          vy: 0
+        };
+      }
+    });
+
+    this.startPhysics();
+  }
+
+  private getNodePos(nodeId: string): GraphNodePoint {
+    const p = this.graphNodePositions[nodeId];
+    if (!p) {
+      return { x: 1000, y: 1000 };
+    }
+    return p;
+  }
+
+  private getNodeDegree(nodeId: string): number {
+    let degree = 0;
+    const edges = this.getGraphEdges();
+    edges.forEach(e => {
+      if (e.fromId === nodeId || e.toId === nodeId) {
+        degree++;
+      }
+    });
+    return degree;
+  }
+
+  private initializeNotesStorage(): void {
+    PersistentStorage.PersistProp(NOTES_STORAGE_KEY, JSON.stringify(SAMPLE_NOTES));
+  }
+
+  private loadNotesFromStorage(): void {
+    const stored = AppStorage.Get<string>(NOTES_STORAGE_KEY);
+    if (!stored) {
+      return;
+    }
+    if (stored.trim().length === 0) {
+      return;
+    }
+    const parsed = this.parseStoredNotes(stored);
+    if (parsed.length === 0) {
+      return;
+    }
+    this.notes = parsed;
+    const exists = parsed.some(note => note.id === this.activeNoteId);
+    this.activeNoteId = exists ? this.activeNoteId : parsed[0].id;
+    this.syncPreviewSnapshotFromActive();
+    this.initForceDirectedLayout();
+  }
+
+  private saveNotesToStorage(): void {
+    const jsonText = JSON.stringify(this.notes);
+    AppStorage.SetOrCreate<string>(NOTES_STORAGE_KEY, jsonText);
+  }
+
+  private parseStoredNotes(raw: string): Note[] {
+    try {
+      const parsed = JSON.parse(raw) as Note[];
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed.filter(item => this.isValidNote(item));
+    } catch {
+      return [];
+    }
+  }
+
+  private isValidNote(note: Note): boolean {
+    return typeof note.id === 'string' && typeof note.title === 'string' && typeof note.body === 'string'
+      && Array.isArray(note.tags) && typeof note.updatedAt === 'string';
+  }
 
   private getActiveNote(): Note | undefined {
     return this.notes.find(note => note.id === this.activeNoteId);
@@ -158,6 +381,8 @@ struct Index {
     const next = this.notes.slice();
     next[index] = updated;
     this.notes = next;
+    this.saveNotesToStorage();
+    this.initForceDirectedLayout();
   }
 
   private formatDate(date: Date): string {
@@ -179,10 +404,13 @@ struct Index {
     const next = this.notes.slice();
     next.unshift(newNote);
     this.notes = next;
+    this.saveNotesToStorage();
     this.activeNoteId = id;
+    this.previewBodySnapshot = body;
     this.compactPanel = 'library';
     this.showSelectedNoteInCompact = this.isCompact;
     this.isNoteEditing = false;
+    this.initForceDirectedLayout();
   }
 
   private openCreateNotePage(): void {
@@ -197,6 +425,7 @@ struct Index {
   }
 
   private openNoteFromLibrary(noteId: string): void {
+    this.syncPreviewSnapshotById(noteId);
     this.activeNoteId = noteId;
     this.isNoteEditing = false;
     if (this.isCompact) {
@@ -208,6 +437,20 @@ struct Index {
   private backToLibraryInCompact(): void {
     this.showSelectedNoteInCompact = false;
     this.isNoteEditing = false;
+  }
+
+  private onActiveNoteIdChanged(): void {
+    this.syncPreviewSnapshotFromActive();
+  }
+
+  private syncPreviewSnapshotFromActive(): void {
+    const note = this.getActiveNote();
+    this.previewBodySnapshot = note ? note.body : '';
+  }
+
+  private syncPreviewSnapshotById(noteId: string): void {
+    const target = this.notes.find(item => item.id === noteId);
+    this.previewBodySnapshot = target ? target.body : '';
   }
 
   private parseTagInput(text: string): string[] {
@@ -281,6 +524,67 @@ struct Index {
     return edges;
   }
 
+  private getGraphRelatedIds(focusId: string): Set<string> {
+    const related = new Set<string>();
+    if (focusId.length === 0) {
+      return related;
+    }
+    related.add(focusId);
+    this.getGraphEdges().forEach(edge => {
+      if (edge.fromId === focusId && edge.toId) {
+        related.add(edge.toId);
+      }
+      if (edge.toId === focusId) {
+        related.add(edge.fromId);
+      }
+    });
+    return related;
+  }
+
+  private getGraphVisibleNotes(): Note[] {
+    if (this.graphFocusedNoteId.length === 0) {
+      return this.notes;
+    }
+    const related = this.getGraphRelatedIds(this.graphFocusedNoteId);
+    return this.notes.filter(note => related.has(note.id));
+  }
+
+  private getGraphVisibleEdges(): GraphEdge[] {
+    if (this.graphFocusedNoteId.length === 0) {
+      return this.getGraphEdges();
+    }
+    const related = this.getGraphRelatedIds(this.graphFocusedNoteId);
+    return this.getGraphEdges().filter(edge => {
+      if (!related.has(edge.fromId)) {
+        return false;
+      }
+      if (!edge.toId) {
+        return edge.fromId === this.graphFocusedNoteId;
+      }
+      return related.has(edge.toId);
+    });
+  }
+
+
+
+  private increaseGraphZoom(): void {
+    this.graphZoom = Math.min(1.8, this.graphZoom + 0.1);
+  }
+
+  private decreaseGraphZoom(): void {
+    this.graphZoom = Math.max(0.7, this.graphZoom - 0.1);
+  }
+
+  private resetGraphView(): void {
+    this.graphZoom = 1;
+    this.graphFocusedNoteId = '';
+  }
+
+  private toggleGraphFocus(noteId: string): void {
+    this.graphFocusedNoteId = this.graphFocusedNoteId === noteId ? '' : noteId;
+    this.openNoteFromLibrary(noteId);
+  }
+
   private getBacklinks(note: Note | undefined): Note[] {
     if (!note) {
       return [];
@@ -328,6 +632,7 @@ struct Index {
 
   private exitNoteEditMode(): void {
     this.isNoteEditing = false;
+    this.syncPreviewSnapshotFromActive();
   }
 
   private getActiveNoteTitle(): string {
@@ -357,6 +662,19 @@ struct Index {
 
   private getActiveBacklinks(): Note[] {
     return this.getBacklinks(this.getActiveNote());
+  }
+
+  private openLinkedNote(linkTitle: string): void {
+    const targetTitle = linkTitle.trim();
+    if (targetTitle.length === 0) {
+      return;
+    }
+    const existed = this.notes.find(note => note.title === targetTitle);
+    if (existed) {
+      this.openNoteFromLibrary(existed.id);
+      return;
+    }
+    this.createNote(targetTitle, `# ${targetTitle}\n\n`, ['链接']);
   }
 
   private parseInline(text: string): InlineToken[] {
@@ -406,13 +724,16 @@ struct Index {
           Span(token.text)
             .fontColor(THEME.accentDeep)
             .fontWeight(FontWeight.Medium)
-            .fontFamily(THEME.fontBody);
+            .fontFamily(THEME.fontBody)
+            .onClick(() => {
+              this.openLinkedNote(token.text);
+            });
         } else {
           Span(token.text)
             .fontColor(color)
             .fontFamily(THEME.fontBody);
         }
-      }, (token: InlineToken, index: number) => `${index}`);
+      }, (token: InlineToken, index: number) => `${this.activeNoteId}-${token.kind}-${index}-${token.text.length}`);
     }
     .fontSize(fontSize)
     .lineHeight(fontSize + 8)
@@ -440,19 +761,14 @@ struct Index {
       .margin({ bottom: 6 });
     } else if (this.lineStartsWith(line, '> ')) {
       Row() {
-        Blank()
-          .width(4)
-          .height('100%')
-          .backgroundColor(THEME.accent)
-          .borderRadius(8)
-          .margin({ right: 8 });
         Column() {
           this.renderInlineText(this.getLineAfterPrefix(line, '> '), 14, THEME.inkMuted);
         }
       }
-      .padding({ top: 6, bottom: 6, left: 6, right: 6 })
+      .padding({ top: 6, bottom: 6, left: 12, right: 6 })
       .backgroundColor(THEME.cardAlt)
-      .borderRadius(10)
+      .border({ width: { left: 4 }, color: { left: THEME.accent }, style: { left: BorderStyle.Solid } })
+      .borderRadius(8)
       .margin({ bottom: 8 });
     } else if (this.isEmptyLine(line)) {
       Blank().height(6);
@@ -462,14 +778,14 @@ struct Index {
   }
 
   @Builder
-  private MarkdownPreview(note: Note | undefined): void {
-    if (!note) {
+  private MarkdownPreview(): void {
+    if (this.previewBodySnapshot.trim().length === 0) {
       Blank().height(0);
     } else {
       Column({ space: 6 }) {
-        ForEach(this.getMarkdownLines(note.body), (line: string, index: number) => {
+        ForEach(this.getMarkdownLines(this.previewBodySnapshot), (line: string, index: number) => {
           this.MarkdownLine(line);
-        }, (line: string, index: number) => `${index}`);
+        }, (line: string, index: number) => `${this.activeNoteId}-${index}-${line.length}`);
       }
     }
   }
@@ -486,6 +802,9 @@ struct Index {
       .border({ width: 1, color: this.compactPanel === value ? THEME.accent : THEME.border })
       .onClick(() => {
         this.compactPanel = value;
+        if (value === 'graph') {
+          this.initForceDirectedLayout();
+        }
         if (value === 'library') {
           this.showSelectedNoteInCompact = false;
         }
@@ -597,6 +916,7 @@ struct Index {
     .borderRadius(20)
     .border({ width: 1, color: THEME.border })
     .shadow({ radius: 12, color: '#12000000', offsetX: 0, offsetY: 6 })
+    .id(`note-panel-${this.getActiveNoteId()}-${this.isNoteEditing ? 'edit' : 'view'}`)
     .height('100%');
   }
 
@@ -719,7 +1039,7 @@ struct Index {
             .borderRadius(12)
             .padding(12)
             .layoutWeight(1)
-            .height(360)
+            .width('100%')
             .onChange((value: string) => {
               this.updateActiveNote({ body: value });
             });
@@ -728,11 +1048,13 @@ struct Index {
             Text(this.getActiveNoteTitle())
               .fontSize(22)
               .fontFamily(THEME.fontTitle)
-              .fontColor(THEME.ink);
+              .fontColor(THEME.ink)
+              .width('100%');
             Text(`更新 ${this.getActiveNoteUpdatedAt()}`)
               .fontSize(11)
               .fontFamily(THEME.fontBody)
-              .fontColor(THEME.inkMuted);
+              .fontColor(THEME.inkMuted)
+              .width('100%');
             Flex({ wrap: FlexWrap.Wrap, direction: FlexDirection.Row }) {
               ForEach(this.getActiveNoteTags(), (tag: string, index: number) => {
                 Text(tag)
@@ -746,19 +1068,25 @@ struct Index {
                   .margin({ right: 6, bottom: 6 });
               }, (tag: string, index: number) => `${this.getActiveNoteId()}-view-tag-${index}`);
             }
-            .margin({ bottom: 6 });
+            .margin({ bottom: 6 })
+            .width('100%');
             Scroll() {
               Column({ space: 10 }) {
-                this.MarkdownPreview(this.getActiveNote());
+                this.MarkdownPreview();
               }
-              .padding(12);
+              .padding(12)
+              .width('100%')
+              .id(`markdown-body-${this.getActiveNoteId()}-${this.previewBodySnapshot.length}`);
             }
+            .id(`preview-${this.getActiveNoteId()}`)
             .backgroundColor(THEME.card)
             .border({ width: 1, color: THEME.border })
             .borderRadius(12)
             .layoutWeight(1)
-            .height(360);
+            .width('100%');
           }
+          .layoutWeight(1)
+          .width('100%');
         }
         Column({ space: 8 }) {
           Text('当前链接')
@@ -780,7 +1108,10 @@ struct Index {
                   .padding({ left: 8, right: 8, top: 3, bottom: 3 })
                   .backgroundColor(THEME.accentSoft)
                   .borderRadius(10)
-                  .margin({ right: 6, bottom: 6 });
+                  .margin({ right: 6, bottom: 6 })
+                  .onClick(() => {
+                    this.openLinkedNote(link);
+                  });
               }, (link: string, index: number) => `${this.getActiveNoteId()}-link-${index}`);
             }
           }
@@ -802,74 +1133,165 @@ struct Index {
         .fontSize(18)
         .fontFamily(THEME.fontTitle)
         .fontColor(THEME.ink);
-      Scroll() {
-        Column({ space: 12 }) {
-          Text('节点')
-            .fontSize(13)
-            .fontFamily(THEME.fontBody)
-            .fontColor(THEME.inkMuted);
-          Flex({ wrap: FlexWrap.Wrap, direction: FlexDirection.Row }) {
-            ForEach(this.notes, (note: Note) => {
+      Row({ space: 8 }) {
+        Button('-')
+          .fontFamily(THEME.fontBody)
+          .fontSize(13)
+          .fontColor(THEME.ink)
+          .backgroundColor(THEME.card)
+          .border({ width: 1, color: THEME.border })
+          .borderRadius(10)
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .onClick(() => {
+            this.decreaseGraphZoom();
+          });
+        Text(`缩放 ${Math.round(this.graphZoom * 100)}%`)
+          .fontSize(12)
+          .fontFamily(THEME.fontBody)
+          .fontColor(THEME.inkMuted)
+          .layoutWeight(1);
+        Button('+')
+          .fontFamily(THEME.fontBody)
+          .fontSize(13)
+          .fontColor(THEME.ink)
+          .backgroundColor(THEME.card)
+          .border({ width: 1, color: THEME.border })
+          .borderRadius(10)
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .onClick(() => {
+            this.increaseGraphZoom();
+          });
+        Button(this.graphFocusedNoteId.length === 0 ? '聚焦: 全部' : '取消聚焦')
+          .fontFamily(THEME.fontBody)
+          .fontSize(12)
+          .fontColor(THEME.ink)
+          .backgroundColor(THEME.accentSoft)
+          .borderRadius(10)
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .onClick(() => {
+            if (this.graphFocusedNoteId.length === 0) {
+              this.graphFocusedNoteId = this.activeNoteId;
+            } else {
+              this.graphFocusedNoteId = '';
+            }
+          });
+        Button('重排图谱')
+          .fontFamily(THEME.fontBody)
+          .fontSize(12)
+          .fontColor(THEME.ink)
+          .backgroundColor(THEME.cardAlt)
+          .border({ width: 1, color: THEME.border })
+          .borderRadius(10)
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .onClick(() => {
+            this.graphNodePositions = {};
+            this.physicsNodes = {};
+            this.physicsAlpha = 1;
+            this.initForceDirectedLayout();
+            this.resetGraphView();
+          });
+      }
+      Stack() {
+        Stack() {
+          ForEach(this.getGraphVisibleEdges(), (edge: GraphEdge, index: number) => {
+            Line()
+              .width(2000)
+              .height(2000)
+              .startPoint([this.getNodePos(edge.fromId).x, this.getNodePos(edge.fromId).y])
+              .endPoint([this.getNodePos(edge.toId || '').x, this.getNodePos(edge.toId || '').y])
+              .stroke((this.graphFocusedNoteId === edge.fromId || this.graphFocusedNoteId === edge.toId) ? THEME.accentDeep : THEME.border)
+              .strokeWidth((this.graphFocusedNoteId === edge.fromId || this.graphFocusedNoteId === edge.toId) ? 2 : 1)
+              .opacity(this.graphFocusedNoteId.length > 0 ? 0.8 : 0.4);
+          }, (edge: GraphEdge, index: number) => `edge-${edge.fromId}-${edge.toTitle}-${index}-${this.draggingNodeId}`);
+          
+          ForEach(this.getGraphVisibleNotes(), (note: Note, index: number) => {
+            Column({ space: 4 }) {
+              Circle({ width: 12 + this.getNodeDegree(note.id) * 3, height: 12 + this.getNodeDegree(note.id) * 3 })
+                .fill(note.id === this.graphFocusedNoteId ? THEME.accentDeep : (note.id === this.activeNoteId ? THEME.accent : THEME.inkMuted))
+                .opacity(note.id === this.graphFocusedNoteId || note.id === this.activeNoteId ? 1 : 0.8);
+              
               Text(note.title)
-                .fontSize(11)
+                .fontSize(10)
                 .fontFamily(THEME.fontBody)
                 .fontColor(note.id === this.activeNoteId ? THEME.ink : THEME.inkMuted)
-                .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-                .backgroundColor(note.id === this.activeNoteId ? THEME.accentSoft : THEME.cardAlt)
-                .borderRadius(10)
-                .border({ width: 1, color: note.id === this.activeNoteId ? THEME.accent : THEME.border })
-                .margin({ right: 6, bottom: 6 });
-            }, (note: Note) => `node-${note.id}`);
-          }
-          Text('连线')
-            .fontSize(13)
-            .fontFamily(THEME.fontBody)
-            .fontColor(THEME.inkMuted);
-          Column({ space: 6 }) {
-            if (this.getGraphEdges().length === 0) {
-              Text('暂无链接')
-                .fontSize(12)
-                .fontFamily(THEME.fontBody)
-                .fontColor(THEME.inkMuted);
-            } else {
-              ForEach(this.getGraphEdges(), (edge: GraphEdge, index: number) => {
-                Text(this.getEdgeLabel(edge))
-                  .fontSize(12)
-                  .fontFamily(THEME.fontBody)
-                  .fontColor(THEME.ink);
-              }, (edge: GraphEdge, index: number) => `${edge.fromId}-${edge.toTitle}-${index}`);
+                .opacity(this.graphZoom < 0.6 && note.id !== this.activeNoteId && note.id !== this.graphFocusedNoteId ? 0 : 1)
             }
-          }
-          Text('反向链接')
-            .fontSize(13)
-            .fontFamily(THEME.fontBody)
-            .fontColor(THEME.inkMuted);
-          Column({ space: 6 }) {
-            if (this.getActiveBacklinks().length === 0) {
-              Text('暂无反链')
-                .fontSize(12)
-                .fontFamily(THEME.fontBody)
-                .fontColor(THEME.inkMuted);
-            } else {
-              ForEach(this.getActiveBacklinks(), (note: Note, index: number) => {
-                Text(note.title)
-                  .fontSize(12)
-                  .fontFamily(THEME.fontBody)
-                  .fontColor(THEME.ink)
-                  .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-                  .backgroundColor(THEME.cardAlt)
-                  .borderRadius(10)
-                  .border({ width: 1, color: THEME.border });
-              }, (note: Note, index: number) => `back-${note.id}`);
-            }
-          }
+            .position({
+              x: this.getNodePos(note.id).x - 50,
+              y: this.getNodePos(note.id).y - (12 + this.getNodeDegree(note.id) * 3) / 2
+            })
+            .width(100)
+            .onClick(() => {
+              this.toggleGraphFocus(note.id);
+            })
+            .gesture(
+              PanGesture()
+                .onActionStart(() => {
+                  this.isDraggingNode = true;
+                  this.draggingNodeId = note.id;
+                  const p = this.physicsNodes[note.id];
+                  if (p) {
+                    this.dragStartX = p.x;
+                    this.dragStartY = p.y;
+                  }
+                  this.wakePhysics();
+                })
+                .onActionUpdate((e) => {
+                  const p = this.physicsNodes[note.id];
+                  if (p) {
+                    p.x = this.dragStartX + e.offsetX / this.graphZoom;
+                    p.y = this.dragStartY + e.offsetY / this.graphZoom;
+                  }
+                  this.wakePhysics();
+                })
+                .onActionEnd(() => {
+                  this.isDraggingNode = false;
+                  this.draggingNodeId = '';
+                  this.wakePhysics();
+                })
+            );
+          }, (note: Note) => `node-${note.id}-${this.draggingNodeId}`);
         }
-        .padding(12)
+        .width(2000)
+        .height(2000)
+        .position({ x: -1000, y: -1000 })
+        .translate({
+          x: 1000 + this.graphPanBase.x + this.graphPanOffset.x,
+          y: 1000 + this.graphPanBase.y + this.graphPanOffset.y
+        })
+        .scale({ x: this.graphZoom, y: this.graphZoom, centerX: 1000, centerY: 1000 });
       }
-      .backgroundColor(THEME.card)
+      .width('100%')
+      .layoutWeight(1)
+      .backgroundColor(THEME.canvas)
+      .borderRadius(12)
       .border({ width: 1, color: THEME.border })
-      .borderRadius(14)
-      .layoutWeight(1);
+      .clip(true)
+      .gesture(
+        PanGesture()
+          .onActionStart(() => {
+            if (this.isDraggingNode) {
+              return;
+            }
+            this.graphPanOffset = { x: 0, y: 0 };
+          })
+          .onActionUpdate((e) => {
+            if (this.isDraggingNode) {
+              return;
+            }
+            this.graphPanOffset = { x: e.offsetX, y: e.offsetY };
+          })
+          .onActionEnd(() => {
+            if (this.isDraggingNode) {
+              return;
+            }
+            this.graphPanBase = {
+              x: this.graphPanBase.x + this.graphPanOffset.x,
+              y: this.graphPanBase.y + this.graphPanOffset.y
+            };
+            this.graphPanOffset = { x: 0, y: 0 };
+          })
+      );
     }
     .padding(16)
     .backgroundColor(THEME.cardAlt)
@@ -903,17 +1325,6 @@ struct Index {
           .padding({ left: 12, right: 12, top: 6, bottom: 6 })
           .onClick(() => {
             this.openCreateNotePage();
-          });
-        Button(this.isCompact ? '三栏布局' : '紧凑模式')
-          .backgroundColor(THEME.cardAlt)
-          .fontColor(THEME.ink)
-          .fontFamily(THEME.fontBody)
-          .fontSize(12)
-          .borderRadius(12)
-          .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-          .border({ width: 1, color: THEME.border })
-          .onClick(() => {
-            this.isCompact = !this.isCompact;
           });
       }
     }
