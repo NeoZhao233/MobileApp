@@ -32,6 +32,18 @@
         ]
       }
     ],
+    "requestPermissions": [
+      {
+        "name": "ohos.permission.READ_MEDIA",
+        "reason": "$string:perm_read_media",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
+      }
+    ],
     "extensionAbilities": [
       {
         "name": "EntryBackupAbility",
