@@ -1,4 +1,5 @@
-﻿import photoAccessHelper from '@ohos.file.photoAccessHelper';
+﻿import promptAction from '@ohos.promptAction';
+import photoAccessHelper from '@ohos.file.photoAccessHelper';
 import common from '@ohos.app.ability.common';
 import { Want } from '@kit.AbilityKit';
 import rdb from '@ohos.data.rdb';
@@ -18,8 +19,9 @@ const NOTES_STORAGE_KEY: string = 'obsidian_lite_notes_json';
 const NOTES_META_KEY: string = 'obsidian_lite_notes_meta_json';
 const NOTE_BODY_PREFIX: string = 'obsidian_lite_note_body_';
 const NOTES_DB_NAME: string = 'obsidian_lite.db';
-const NOTES_DB_VERSION: number = 1;
+const NOTES_DB_VERSION: number = 2;
 const NOTES_TABLE: string = 'notes';
+const VAULTS_TABLE: string = 'vaults';
 const NOTE_BODY_DIR: string = 'note_bodies';
 const FAB_SIZE: number = 50;
 const FAB_MARGIN_RIGHT: number = 20;
@@ -29,6 +31,28 @@ type InlineTokenKind = 'text' | 'bold' | 'code' | 'link';
 
 type LengthValue = string | number | Resource;
 
+interface Vault {
+  id: string;
+  name: string;
+  description: string;
+  color: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+const VAULTS_STORAGE_KEY = '@obsidian_lite_vaults';
+
+const SAMPLE_VAULTS: Vault[] = [
+  {
+    id: 'vault-demo',
+    name: '默认知识库',
+    description: '你的第一个本地知识库，记录灵感与思考',
+    color: '#1B6EF3', // THEME.primary
+    createdAt: '2026-04-19',
+    updatedAt: '2026-04-19'
+  }
+];
+
 interface InlineToken {
   kind: InlineTokenKind;
   text: string;
@@ -36,6 +60,7 @@ interface InlineToken {
 
 interface Note {
   id: string;
+  vaultId: string;
   title: string;
   category: string;
   body: string;
@@ -49,6 +74,7 @@ interface Note {
 
 interface NoteMeta {
   id: string;
+  vaultId: string;
   title: string;
   category: string;
   tags: string[];
@@ -188,6 +214,7 @@ const THEME: ThemeTokens = {
 const SAMPLE_NOTES: Note[] = [
   {
     id: 'n1',
+    vaultId: 'vault-demo',
     title: '欢迎来到轻量笔记',
     category: '快速入门',
     body: '# 你好，Obsidian Lite\n\n- 这是一个原型演示\n- 支持 **加粗** 与 `代码`\n- 试试 [[双向链接]] 与 [[标签系统]]\n\n> 记得保持专注与轻盈。\n',
@@ -200,6 +227,7 @@ const SAMPLE_NOTES: Note[] = [
   },
   {
     id: 'n2',
+    vaultId: 'vault-demo',
     title: '标签系统',
     category: '知识管理',
     body: '## 标签是知识的抽屉\n\n- 标签帮助快速分类\n- 点击标签可筛选\n\n和 [[搜索技巧]] 配合更高效。',
@@ -212,6 +240,7 @@ const SAMPLE_NOTES: Note[] = [
   },
   {
     id: 'n3',
+    vaultId: 'vault-demo',
     title: '双向链接',
     category: '知识管理',
     body: '## 让笔记彼此对话\n\n把相关概念连在一起：\n- [[标签系统]]\n- [[项目仪表盘]]\n\n> 反向链接会自动出现。',
@@ -224,6 +253,7 @@ const SAMPLE_NOTES: Note[] = [
   },
   {
     id: 'n4',
+    vaultId: 'vault-demo',
     title: '搜索技巧',
     category: '知识管理',
     body: '### 全文搜索\n\n你可以搜索标题、正文与标签。\n\n试试搜索 **系统** 或 `链接`。',
@@ -236,6 +266,7 @@ const SAMPLE_NOTES: Note[] = [
   },
   {
     id: 'n5',
+    vaultId: 'vault-demo',
     title: '项目仪表盘',
     category: '工作项目',
     body: '# 项目\n\n- 本周目标\n- 重要里程碑\n- 风险与阻塞\n\n相关笔记：[[双向链接]]',
@@ -248,6 +279,7 @@ const SAMPLE_NOTES: Note[] = [
   },
   {
     id: 'n6',
+    vaultId: 'vault-demo',
     title: '每日回顾',
     category: '日常记录',
     body: '## 今日小结\n\n- 做得好的事\n- 想要改进的点\n- 明日计划\n\n连接到 [[项目仪表盘]]。',
@@ -270,6 +302,8 @@ const SORT_OPTIONS: SortOption[] = [
 @Entry
 @Component
 struct Index {
+  @State vaults: Vault[] = [];
+  @State activeVaultId: string = '';
   @State notes: Note[] = SAMPLE_NOTES;
   @Watch('onActiveNoteIdChanged')
   @State activeNoteId: string = SAMPLE_NOTES[0].id;
@@ -285,6 +319,10 @@ struct Index {
   @State compactPanel: CompactPanel = 'library';
   @State newTagText: string = '';
   @State showCreateNotePage: boolean = false;
+  @State showVaultEditorPage: boolean = false;
+  @State editingVaultId: string = '';
+  @State draftVaultName: string = '';
+  @State draftVaultDescription: string = '';
   @State draftTitle: string = '';
   @State draftCategory: string = '默认分类';
   @State draftBody: string = '';
@@ -306,6 +344,8 @@ struct Index {
   private physicsAlpha: number = 0;
   private dragStartX: number = 0;
   private dragStartY: number = 0;
+  private dragLastOffsetX: number = 0;
+  private dragLastOffsetY: number = 0;
   private previewScroller: Scroller = new Scroller();
   private libraryScroller: Scroller = new Scroller();
   private saveTimer: number = -1;
@@ -318,6 +358,7 @@ struct Index {
   async aboutToAppear(): Promise<void> {
     this.initializeNotesStorage();
     await this.ensureDatabaseReady();
+    await this.loadVaultsFromDatabase();
     await this.loadNotesFromStorage();
   }
 
@@ -348,10 +389,11 @@ struct Index {
 
     let totalVelocity = 0;
     const edges = this.getGraphEdges();
+    const currentNotes = this.getFilteredNotes();
 
-    this.notes.forEach(n1 => {
-      this.notes.forEach(n2 => {
-        if (n1.id === n2.id) {
+    currentNotes.forEach(n1 => {
+      currentNotes.forEach(n2 => {
+        if (n1.id === n2.id || n1.id > n2.id) {
           return;
         }
         const p1 = this.physicsNodes[n1.id];
@@ -367,6 +409,27 @@ struct Index {
           const force = 4000 / (d * d);
           p1.vx += (dx / d) * force * this.physicsAlpha;
           p1.vy += (dy / d) * force * this.physicsAlpha;
+          p2.vx -= (dx / d) * force * this.physicsAlpha;
+          p2.vy -= (dy / d) * force * this.physicsAlpha;
+        }
+
+        const minDistance = 48;
+        if (d < minDistance) {
+          const overlap = minDistance - d;
+          const nx = dx / d;
+          const ny = dy / d;
+          if (this.draggingNodeId === n1.id) {
+            p2.x -= nx * overlap;
+            p2.y -= ny * overlap;
+          } else if (this.draggingNodeId === n2.id) {
+            p1.x += nx * overlap;
+            p1.y += ny * overlap;
+          } else {
+            p1.x += nx * overlap * 0.5;
+            p1.y += ny * overlap * 0.5;
+            p2.x -= nx * overlap * 0.5;
+            p2.y -= ny * overlap * 0.5;
+          }
         }
       });
     });
@@ -389,7 +452,7 @@ struct Index {
       p2.vy -= (dy / d) * force * this.physicsAlpha;
     });
 
-    this.notes.forEach(n1 => {
+    currentNotes.forEach(n1 => {
       const p1 = this.physicsNodes[n1.id];
       if (!p1) return;
 
@@ -427,12 +490,40 @@ struct Index {
   }
 
   private initForceDirectedLayout(): void {
-    if (Object.keys(this.graphNodePositions).length === this.notes.length && Object.keys(this.physicsNodes).length === this.notes.length) {
-      this.wakePhysics();
+    const currentNotes = this.getFilteredNotes();
+    const visibleIds = new Set<string>();
+    currentNotes.forEach(note => visibleIds.add(note.id));
+
+    if (this.graphFocusedNoteId.length > 0 && !visibleIds.has(this.graphFocusedNoteId)) {
+      this.graphFocusedNoteId = '';
+    }
+
+    const nextPhysics: Record<string, GraphPhysicsNode> = {};
+    Object.keys(this.physicsNodes).forEach((id: string) => {
+      if (visibleIds.has(id)) {
+        nextPhysics[id] = this.physicsNodes[id];
+      }
+    });
+    this.physicsNodes = nextPhysics;
+
+    const nextPos: Record<string, GraphNodePoint> = {};
+    Object.keys(this.graphNodePositions).forEach((id: string) => {
+      if (visibleIds.has(id)) {
+        nextPos[id] = this.graphNodePositions[id];
+      }
+    });
+    this.graphNodePositions = nextPos;
+
+    if (currentNotes.length === 0) {
+      if (this.physicsTimer !== -1) {
+        clearInterval(this.physicsTimer);
+        this.physicsTimer = -1;
+      }
+      this.physicsAlpha = 0;
       return;
     }
-    
-    this.notes.forEach(n => {
+
+    currentNotes.forEach(n => {
       if (!this.physicsNodes[n.id]) {
         this.physicsNodes[n.id] = {
           x: 1000 + (Math.random() * 400 - 200),
@@ -506,6 +597,7 @@ struct Index {
     const store = await this.getRdbStore();
     const sql = `CREATE TABLE IF NOT EXISTS ${NOTES_TABLE} (
       id TEXT PRIMARY KEY,
+      vaultId TEXT,
       title TEXT,
       category TEXT,
       tags TEXT,
@@ -516,6 +608,16 @@ struct Index {
       preview TEXT
     )`;
     await store.executeSql(sql);
+
+    const vaultSql = `CREATE TABLE IF NOT EXISTS ${VAULTS_TABLE} (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      description TEXT,
+      color TEXT,
+      createdAt TEXT,
+      updatedAt TEXT
+    )`;
+    await store.executeSql(vaultSql);
   }
 
   private async getRdbStore(): Promise<rdb.RdbStore> {
@@ -542,24 +644,61 @@ struct Index {
     }
   }
 
+  private async loadVaultsFromDatabase(): Promise<void> {
+    const store = await this.getRdbStore();
+    const resultSet = await store.querySql(
+      `SELECT id, name, description, color, createdAt, updatedAt FROM ${VAULTS_TABLE}`
+    );
+    const loadedVaults: Vault[] = [];
+    while (resultSet.goToNextRow()) {
+      loadedVaults.push({
+        id: resultSet.getString(0),
+        name: resultSet.getString(1),
+        description: resultSet.getString(2),
+        color: resultSet.getString(3),
+        createdAt: resultSet.getString(4),
+        updatedAt: resultSet.getString(5)
+      });
+    }
+    resultSet.close();
+
+    if (loadedVaults.length === 0) {
+      this.vaults = SAMPLE_VAULTS;
+      for (const vault of this.vaults) {
+        await store.insert(VAULTS_TABLE, {
+          id: vault.id,
+          name: vault.name,
+          description: vault.description,
+          color: vault.color,
+          createdAt: vault.createdAt,
+          updatedAt: vault.updatedAt
+        });
+      }
+    } else {
+      this.vaults = loadedVaults;
+    }
+  }
+
   private async loadNotesFromDatabase(): Promise<Note[]> {
     const store = await this.getRdbStore();
     const resultSet = await store.querySql(
-      `SELECT id, title, category, tags, isPinned, createdAt, lastVisitedAt, updatedAt, preview FROM ${NOTES_TABLE}`
+      `SELECT id, vaultId, title, category, tags, isPinned, createdAt, lastVisitedAt, updatedAt, preview FROM ${NOTES_TABLE}`
     );
     const notes: Note[] = [];
     while (resultSet.goToNextRow()) {
       const id = resultSet.getString(0);
-      const title = resultSet.getString(1);
-      const category = resultSet.getString(2);
-      const tagsRaw = resultSet.getString(3);
-      const isPinned = resultSet.getLong(4) === 1;
-      const createdAt = resultSet.getString(5);
-      const lastVisitedAt = resultSet.getString(6);
-      const updatedAt = resultSet.getString(7);
-      const preview = resultSet.getString(8);
+      const vaultId = resultSet.getString(1);
+      const title = resultSet.getString(2);
+      const category = resultSet.getString(3);
+      const tagsRaw = resultSet.getString(4);
+      const isPinned = resultSet.getLong(5) === 1;
+      const createdAt = resultSet.getString(6);
+      const lastVisitedAt = resultSet.getString(7);
+      const updatedAt = resultSet.getString(8);
+      const preview = resultSet.getString(9);
       notes.push({
         id,
+        vaultId: vaultId || 'vault-demo',
         title,
         category,
         body: preview,
@@ -587,6 +726,7 @@ struct Index {
     const body = this.loadNoteBody(noteId);
     const updated: Note = {
       id: base.id,
+      vaultId: base.vaultId,
       title: base.title,
       category: base.category,
       body,
@@ -900,6 +1040,7 @@ struct Index {
   private toNoteMeta(note: Note): NoteMeta {
     return {
       id: note.id,
+      vaultId: note.vaultId,
       title: note.title,
       category: note.category,
       tags: note.tags,
@@ -930,9 +1071,10 @@ struct Index {
       const note = this.notes[i];
       const preview = this.getExcerpt(note.body);
       await store.executeSql(
-        `INSERT OR REPLACE INTO ${NOTES_TABLE} (id, title, category, tags, isPinned, createdAt, lastVisitedAt, updatedAt, preview) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT OR REPLACE INTO ${NOTES_TABLE} (id, vaultId, title, category, tags, isPinned, createdAt, lastVisitedAt, updatedAt, preview) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         , [
           note.id,
+          note.vaultId || 'vault-demo',
           note.title,
           note.category,
           this.serializeTags(note.tags),
@@ -989,6 +1131,7 @@ struct Index {
   private buildNoteFromMeta(meta: NoteMeta, body: string): Note {
     const note: Note = {
       id: meta.id,
+      vaultId: meta.vaultId || 'vault-demo',
       title: meta.title,
       category: meta.category,
       body,
@@ -1055,7 +1198,7 @@ struct Index {
   }
 
   private getFilteredNotes(): Note[] {
-    let result = this.notes;
+    let result = this.notes.filter(note => note.vaultId === this.activeVaultId);
     if (this.activeCategory.trim().length > 0) {
       result = result.filter(note => note.category === this.activeCategory);
     }
@@ -1299,6 +1442,7 @@ struct Index {
     const bodyUpdated = patch.body !== undefined;
     const updated: Note = {
       id: base.id,
+      vaultId: patch.vaultId ?? base.vaultId,
       title: patch.title ?? base.title,
       category: patch.category ?? base.category,
       body: patch.body ?? base.body,
@@ -1335,6 +1479,7 @@ struct Index {
     const id = `n${Date.now()}-${Math.floor(Math.random() * 10000)}`;
     const newNote: Note = {
       id,
+      vaultId: this.activeVaultId || 'vault-demo',
       title,
       category,
       body,
@@ -1360,7 +1505,7 @@ struct Index {
 
   private openDailyNote(): void {
     const today = this.formatDate(new Date());
-    const existing = this.notes.find(note => note.title === today);
+    const existing = this.notes.find(note => note.title === today && note.vaultId === this.activeVaultId);
     if (existing) {
       this.openNoteFromLibrary(existing.id);
       return;
@@ -1571,10 +1716,11 @@ struct Index {
   }
 
   private getGraphEdges(): GraphEdge[] {
+    const currentNotes = this.getFilteredNotes();
     const titleMap = new Map<string, string>();
-    this.notes.forEach(note => titleMap.set(note.title, note.id));
+    currentNotes.forEach(note => titleMap.set(note.title, note.id));
     const edges: GraphEdge[] = [];
-    this.notes.forEach(note => {
+    currentNotes.forEach(note => {
       const links = this.extractLinks(note.body);
       links.forEach(linkTitle => {
         edges.push({
@@ -1606,11 +1752,12 @@ struct Index {
   }
 
   private getGraphVisibleNotes(): Note[] {
+    const filteredNotes = this.getFilteredNotes();
     if (this.graphFocusedNoteId.length === 0) {
-      return this.notes;
+      return filteredNotes;
     }
     const related = this.getGraphRelatedIds(this.graphFocusedNoteId);
-    return this.notes.filter(note => related.has(note.id));
+    return filteredNotes.filter(note => related.has(note.id));
   }
 
   private getGraphVisibleEdges(): GraphEdge[] {
@@ -2218,6 +2365,286 @@ struct Index {
   }
 
   @Builder
+  private VaultCard(vault: Vault): void {
+    Column({ space: 12 }) {
+      Row() {
+        Column({ space: 4 }) {
+          Text(vault.name)
+            .fontSize(18)
+            .fontWeight(FontWeight.Bold)
+            .fontFamily(THEME.fontTitle)
+            .fontColor(THEME.ink)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis });
+          Text(`创建于 ${vault.createdAt}`)
+            .fontSize(12)
+            .fontColor(THEME.inkMuted)
+            .fontFamily(THEME.fontBody);
+        }
+        .layoutWeight(1)
+        .alignItems(HorizontalAlign.Start);
+
+        Text(vault.name.charAt(0).toUpperCase())
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(THEME.onPrimaryContainer)
+          .textAlign(TextAlign.Center)
+          .width(40)
+          .height(40)
+          .backgroundColor(THEME.primaryContainer)
+          .borderRadius(20);
+      }
+      .width('100%');
+
+      Text(vault.description || '暂无描述')
+        .fontSize(14)
+        .fontFamily(THEME.fontBody)
+        .fontColor(THEME.inkMuted)
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .width('100%');
+        
+      Row() {
+        Text(`${this.notes.filter(n => n.vaultId === vault.id).length} 篇笔记`)
+          .fontSize(12)
+          .fontColor(THEME.primary)
+          .fontFamily(THEME.fontBody)
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .backgroundColor(THEME.primaryContainer)
+          .borderRadius(8);
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.Start);
+    }
+    .padding(20)
+    .backgroundColor(THEME.surface)
+    .borderRadius(THEME.radiusLarge)
+    .border({ width: 1, color: THEME.outline })
+    .shadow(THEME.elevation1)
+    .onClick(() => {
+      animateTo({ duration: 400, curve: Curve.Friction }, () => {
+        this.activeVaultId = vault.id;
+        const vaultNotes = this.getFilteredNotes();
+        if (vaultNotes.length > 0) {
+          this.activeNoteId = vaultNotes[0].id;
+          this.syncPreviewSnapshotFromActive();
+        } else {
+          this.activeNoteId = '';
+          this.previewBodySnapshot = '';
+          this.graphFocusedNoteId = '';
+        }
+        this.initForceDirectedLayout();
+      });
+    })
+    .gesture(
+      LongPressGesture({ repeat: false, duration: 500 })
+        .onAction(() => {
+          promptAction.showActionMenu({
+            title: `操作: ${vault.name}`,
+            buttons: [
+              { text: '编辑知识库信息', color: THEME.ink },
+              { text: '删除此知识库 (含笔记)', color: THEME.error }
+            ]
+          }).then(async (data) => {
+            if (data.index === 0) {
+              this.openEditVaultPage(vault);
+              return;
+            }
+            if (data.index === 1) {
+              const confirmResp = await promptAction.showDialog({
+                title: '不可逆警告',
+                message: `确定要彻底删除知识库吗？操作无法恢复。`,
+                buttons: [
+                  { text: '取消', color: THEME.ink },
+                  { text: '彻底删除', color: THEME.error }
+                ]
+              });
+              if (confirmResp.index === 1) {
+                animateTo({ duration: 300 }, () => {
+                  this.vaults = this.vaults.filter(v => v.id !== vault.id);
+                  this.notes = this.notes.filter(n => n.vaultId !== vault.id);
+                });
+                const store = await this.getRdbStore();
+                const preds = new rdb.RdbPredicates(VAULTS_TABLE);
+                preds.equalTo('id', vault.id);
+                await store.delete(preds);
+                const notePreds = new rdb.RdbPredicates(NOTES_TABLE);
+                notePreds.equalTo('vaultId', vault.id);
+                await store.delete(notePreds);
+                promptAction.showToast({ message: '知识库已彻底删除' });
+              }
+            }
+          }).catch(() => {});
+        })
+    );
+  }
+
+  @Builder
+  private VaultsPanel(): void {
+    Stack({ alignContent: Alignment.BottomEnd }) {
+      Column({ space: 16 }) {
+        Text('我的知识库')
+          .fontSize(24)
+          .fontWeight(FontWeight.Bold)
+          .fontFamily(THEME.fontTitle)
+          .fontColor(THEME.ink)
+          .width('100%')
+          .padding({ bottom: 8, top: 8 })
+          .border({ width: { bottom: 1 }, color: THEME.outline });
+        
+        if (this.vaults.length === 0) {
+          Column({ space: 16 }) {
+            Text('📚')
+              .fontSize(64)
+            Text('没有任何知识库')
+              .fontSize(18)
+              .fontColor(THEME.ink)
+              .fontWeight(FontWeight.Bold)
+            Text('点击右下角加号，创建你的第一个知识库吧')
+              .fontSize(14)
+              .fontColor(THEME.inkMuted)
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .justifyContent(FlexAlign.Center)
+          .alignItems(HorizontalAlign.Center)
+        } else {
+          Scroll() {
+            Grid() {
+              ForEach(this.vaults, (vault: Vault) => {
+                GridItem() {
+                  this.VaultCard(vault);
+                }
+              }, (vault: Vault) => vault.id);
+            }
+            .columnsTemplate(this.isCompact ? '1fr' : '1fr 1fr 1fr')
+            .columnsGap(16)
+            .rowsGap(16)
+            .width('100%');
+          }
+          .layoutWeight(1)
+          .width('100%');
+        }
+      }
+      .justifyContent(FlexAlign.Start)
+      .alignItems(HorizontalAlign.Start)
+      .padding({ left: 24, right: 24, top: 16 })
+      .width('100%')
+      .height('100%');
+
+      Column() {
+        Button() {
+          Text('+')
+            .fontSize(24)
+            .fontColor(THEME.onPrimary)
+            .fontWeight(FontWeight.Medium)
+        }
+        .type(ButtonType.Circle)
+        .width(FAB_SIZE)
+        .height(FAB_SIZE)
+        .backgroundColor(THEME.primary)
+        .shadow(THEME.elevation3)
+        .stateEffect(true)
+        .onClick(() => {
+          this.createNewVault();
+        });
+      }
+      .width(FAB_SIZE)
+      .height(FAB_SIZE)
+      .margin({ right: FAB_MARGIN_RIGHT + 16, bottom: FAB_MARGIN_BOTTOM + 16 });
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(THEME.surfaceVariant);
+  }
+
+  private createNewVault(): void {
+    this.openCreateVaultPage();
+  }
+
+  private openCreateVaultPage(): void {
+    this.editingVaultId = '';
+    this.draftVaultName = `新知识库 ${this.vaults.length + 1}`;
+    this.draftVaultDescription = '点击以管理该知识库内的笔记';
+    this.showVaultEditorPage = true;
+  }
+
+  private openEditVaultPage(vault: Vault): void {
+    this.editingVaultId = vault.id;
+    this.draftVaultName = vault.name;
+    this.draftVaultDescription = vault.description;
+    this.showVaultEditorPage = true;
+  }
+
+  private closeVaultEditorPage(): void {
+    this.showVaultEditorPage = false;
+  }
+
+  private async confirmVaultEditor(): Promise<void> {
+    const name = this.draftVaultName.trim();
+    if (name.length === 0) {
+      promptAction.showToast({ message: '知识库名称不能为空' });
+      return;
+    }
+    const description = this.draftVaultDescription.trim().length > 0
+      ? this.draftVaultDescription.trim()
+      : '点击以管理该知识库内的笔记';
+    const now = this.formatDate(new Date());
+
+    try {
+      const store = await this.getRdbStore();
+      if (this.editingVaultId.length === 0) {
+        const newVault: Vault = {
+          id: `vault-${Date.now()}`,
+          name,
+          description,
+          color: THEME.primary,
+          createdAt: now,
+          updatedAt: now
+        };
+        animateTo({ duration: 300, curve: Curve.FastOutSlowIn }, () => {
+          this.vaults.push(newVault);
+        });
+        await store.insert(VAULTS_TABLE, {
+          id: newVault.id,
+          name: newVault.name,
+          description: newVault.description,
+          color: newVault.color,
+          createdAt: newVault.createdAt,
+          updatedAt: newVault.updatedAt
+        });
+      } else {
+        const current = this.vaults.find(item => item.id === this.editingVaultId);
+        if (!current) {
+          this.closeVaultEditorPage();
+          return;
+        }
+        const updatedVault: Vault = {
+          id: current.id,
+          name,
+          description,
+          color: current.color,
+          createdAt: current.createdAt,
+          updatedAt: now
+        };
+        animateTo({ duration: 220, curve: Curve.EaseOut }, () => {
+          this.vaults = this.vaults.map(item => item.id === updatedVault.id ? updatedVault : item);
+        });
+        const predicates = new rdb.RdbPredicates(VAULTS_TABLE);
+        predicates.equalTo('id', updatedVault.id);
+        await store.update({
+          name: updatedVault.name,
+          description: updatedVault.description,
+          updatedAt: updatedVault.updatedAt
+        }, predicates);
+      }
+      this.closeVaultEditorPage();
+    } catch (err) {
+      promptAction.showToast({ message: '保存知识库失败，请稍后重试' });
+    }
+  }
+
+  @Builder
   private NoteCard(note: Note, isActive: boolean): void {
     Column({ space: 8 }) {
       Row({ space: 6 }) {
@@ -2366,17 +2793,35 @@ struct Index {
         }
 
         Scroll(this.libraryScroller) {
-          Grid() {
-            ForEach(this.getFilteredNotes(), (note: Note) => {
-              GridItem() {
-                this.NoteCard(note, note.id === this.activeNoteId);
-              }
-            }, (note: Note) => note.id);
+          if (this.getFilteredNotes().length === 0) {
+            Column({ space: 16 }) {
+              Text('✨')
+                .fontSize(48)
+              Text(this.searchText.length > 0 ? '没有找到相关笔记' : '知识库空空如也')
+                .fontSize(16)
+                .fontColor(THEME.ink)
+                .fontWeight(FontWeight.Bold)
+              Text(this.searchText.length > 0 ? '试试换个关键词关键词' : '点击右下角的加号，写下属于你的第一篇笔记吧！')
+                .fontSize(12)
+                .fontColor(THEME.inkMuted)
+            }
+            .width('100%')
+            .padding({ top: 60 })
+            .justifyContent(FlexAlign.Center)
+            .alignItems(HorizontalAlign.Center)
+          } else {
+            Grid() {
+              ForEach(this.getFilteredNotes(), (note: Note) => {
+                GridItem() {
+                  this.NoteCard(note, note.id === this.activeNoteId);
+                }
+              }, (note: Note) => note.id);
+            }
+            .columnsTemplate(this.isCompact ? '1fr' : '1fr 1fr')
+            .columnsGap(12)
+            .rowsGap(12)
+            .width('100%');
           }
-          .columnsTemplate(this.isCompact ? '1fr' : '1fr 1fr')
-          .columnsGap(12)
-          .rowsGap(12)
-          .width('100%');
         }
         .layoutWeight(1)
         .width('100%');
@@ -2764,10 +3209,14 @@ struct Index {
                 .onActionStart(() => {
                   this.isDraggingNode = true;
                   this.draggingNodeId = note.id;
+                  this.dragLastOffsetX = 0;
+                  this.dragLastOffsetY = 0;
                   const p = this.physicsNodes[note.id];
                   if (p) {
                     this.dragStartX = p.x;
                     this.dragStartY = p.y;
+                    p.vx = 0;
+                    p.vy = 0;
                   }
                   this.wakePhysics();
                 })
@@ -2776,10 +3225,21 @@ struct Index {
                   if (p) {
                     p.x = this.dragStartX + e.offsetX / this.graphZoom;
                     p.y = this.dragStartY + e.offsetY / this.graphZoom;
+                    const deltaX = (e.offsetX - this.dragLastOffsetX) / this.graphZoom;
+                    const deltaY = (e.offsetY - this.dragLastOffsetY) / this.graphZoom;
+                    p.vx = deltaX * 0.6;
+                    p.vy = deltaY * 0.6;
                   }
+                  this.dragLastOffsetX = e.offsetX;
+                  this.dragLastOffsetY = e.offsetY;
                   this.wakePhysics();
                 })
                 .onActionEnd(() => {
+                  const p = this.physicsNodes[note.id];
+                  if (p) {
+                    p.vx *= 1.2;
+                    p.vy *= 1.2;
+                  }
                   this.isDraggingNode = false;
                   this.draggingNodeId = '';
                   this.wakePhysics();
@@ -2838,9 +3298,26 @@ struct Index {
 
   @Builder
   private TopBar(): void {
-    Row() {
+    Row({ space: 12 }) {
+      if (this.activeVaultId !== '') {
+        Button('<')
+          .backgroundColor(THEME.surfaceVariant)
+          .fontColor(THEME.ink)
+          .fontSize(16)
+          .fontWeight(FontWeight.Bold)
+          .width(36)
+          .height(36)
+          .borderRadius(18)
+          .border({ width: 1, color: THEME.outline })
+          .stateEffect(true)
+          .onClick(() => {
+            animateTo({ duration: 300, curve: Curve.FastOutSlowIn }, () => {
+              this.activeVaultId = '';
+            });
+          });
+      }
       Column({ space: 4 }) {
-        Text('Obsidian Lite')
+        Text(this.activeVaultId === '' ? 'Obsidian Lite' : (this.vaults.find(v => v.id === this.activeVaultId)?.name || '未命名知识库'))
           .fontSize(22)
           .fontFamily(THEME.fontTitle)
           .fontColor(THEME.ink);
@@ -2849,23 +3326,27 @@ struct Index {
           .fontFamily(THEME.fontBody)
           .fontColor(THEME.inkMuted);
       }
-      .layoutWeight(1);
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start);
+
       Row({ space: 8 }) {
-        Button('今日笔记')
-          .backgroundColor(THEME.primaryContainer)
-          .fontColor(THEME.onPrimaryContainer)
-          .fontFamily(THEME.fontBody)
-          .fontSize(12)
-          .borderRadius(THEME.radiusMedium)
-          .border({ width: 1, color: THEME.primaryContainer })
-          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-          .stateEffect(true)
-          .onClick(() => {
-            this.openDailyNote();
-          });
+        if (this.activeVaultId !== '') {
+          Button('今日笔记')
+            .backgroundColor(THEME.primaryContainer)
+            .fontColor(THEME.onPrimaryContainer)
+            .fontFamily(THEME.fontBody)
+            .fontSize(12)
+            .borderRadius(THEME.radiusMedium)
+            .border({ width: 1, color: THEME.primaryContainer })
+            .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+            .stateEffect(true)
+            .onClick(() => {
+              this.openDailyNote();
+            });
+        }
       }
     }
-    .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+    .padding({ left: 12, right: 16, top: 6, bottom: 6 })
     .backgroundColor(THEME.surface)
     .borderRadius(THEME.radiusLarge)
     .border({ width: 1, color: THEME.outline })
@@ -2879,6 +3360,81 @@ struct Index {
       return `${item.fromTitle}->${item.toTitle}` === reverseKey;
     });
     return `${edge.fromTitle} -> ${edge.toTitle}${isBidirectional ? ' (双向)' : ''}`;
+  }
+
+  @Builder
+  private VaultEditorPage(): void {
+    Column() {
+      Column({ space: 10 }) {
+        Text(this.editingVaultId.length === 0 ? '创建知识库' : '编辑知识库')
+          .fontSize(24)
+          .fontFamily(THEME.fontTitle)
+          .fontColor(THEME.ink);
+        Text('名称和说明会展示在知识库卡片上')
+          .fontSize(12)
+          .fontFamily(THEME.fontBody)
+          .fontColor(THEME.inkMuted)
+          .margin({ bottom: 6 });
+        TextInput({ text: this.draftVaultName, placeholder: '输入知识库名称' })
+          .fontSize(17)
+          .fontFamily(THEME.fontTitle)
+          .fontColor(THEME.ink)
+          .backgroundColor(THEME.card)
+          .border({ width: 1, color: THEME.border })
+          .borderRadius(12)
+          .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+          .onChange((value: string) => {
+            this.draftVaultName = value;
+          });
+        TextArea({ text: this.draftVaultDescription, placeholder: '输入卡片描述，例如：点击以管理该知识库内的笔记' })
+          .fontSize(13)
+          .fontFamily(THEME.fontBody)
+          .fontColor(THEME.ink)
+          .backgroundColor(THEME.card)
+          .border({ width: 1, color: THEME.border })
+          .borderRadius(12)
+          .padding(12)
+          .height(120)
+          .onChange((value: string) => {
+            this.draftVaultDescription = value;
+          });
+        Row({ space: 10 }) {
+          Button('取消')
+            .layoutWeight(1)
+            .backgroundColor(THEME.cardAlt)
+            .fontColor(THEME.ink)
+            .fontFamily(THEME.fontBody)
+            .fontSize(13)
+            .borderRadius(12)
+            .border({ width: 1, color: THEME.border })
+            .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+            .onClick(() => {
+              this.closeVaultEditorPage();
+            });
+          Button(this.editingVaultId.length === 0 ? '创建' : '保存')
+            .layoutWeight(1)
+            .backgroundColor(THEME.accent)
+            .fontColor(THEME.onPrimary)
+            .fontFamily(THEME.fontBody)
+            .fontSize(13)
+            .borderRadius(12)
+            .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+            .onClick(() => {
+              this.confirmVaultEditor();
+            });
+        }
+      }
+      .padding(16)
+      .backgroundColor(THEME.surface)
+      .borderRadius(THEME.radiusLarge)
+      .border({ width: 1, color: THEME.outline })
+      .shadow(THEME.elevation3);
+    }
+    .width('100%')
+    .height('100%')
+    .padding(16)
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor('#CCF5F6FA');
   }
 
   @Builder
@@ -3008,7 +3564,10 @@ struct Index {
       this.BackgroundLayer();
       Column({ space: 16 }) {
         this.TopBar();
-        if (this.isCompact) {
+        if (this.activeVaultId === '') {
+          this.VaultsPanel();
+        } else {
+          if (this.isCompact) {
           Row({ space: 10 }) {
             this.SegmentButton('笔记', 'library');
             this.SegmentButton('图谱', 'graph');
@@ -3044,11 +3603,15 @@ struct Index {
           }
           .layoutWeight(1);
         }
+        }
       }
       .padding({ left: 16, right: 16, top: 16, bottom: 16 })
       .width('100%')
       .height('100%');
-      if (this.showCreateNotePage) {
+      if (this.showVaultEditorPage) {
+        this.VaultEditorPage();
+      }
+      if (this.showCreateNotePage && this.activeVaultId !== '') {
         this.CreateNotePage();
       }
     }
