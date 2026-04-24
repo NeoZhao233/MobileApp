@@ -334,8 +334,10 @@ struct Index {
   @State graphZoom: number = 1;
   @State graphFocusedNoteId: string = '';
   @State graphNodePositions: Record<string, GraphNodePoint> = {};
-  @State graphPanBase: GraphNodePoint = { x: -600, y: -600 };
+  @State graphPanBase: GraphNodePoint = { x: 0, y: 0 };
   @State graphPanOffset: GraphNodePoint = { x: 0, y: 0 };
+  @State graphViewportWidth: number = 0;
+  @State graphViewportHeight: number = 0;
   @State draggingNodeId: string = '';
   @State draggingNodeOffset: GraphNodePoint = { x: 0, y: 0 };
   @State isDraggingNode: boolean = false;
@@ -1786,9 +1788,24 @@ struct Index {
     this.graphZoom = Math.max(0.7, this.graphZoom - 0.1);
   }
 
+  private centerGraphViewport(force: boolean = false): void {
+    const width = this.graphViewportWidth > 0 ? this.graphViewportWidth : 360;
+    const height = this.graphViewportHeight > 0 ? this.graphViewportHeight : 520;
+    const targetX = width / 2 - 1000;
+    const targetY = height / 2 - 1000;
+    if (!force) {
+      if (Math.abs(this.graphPanBase.x - targetX) < 1 && Math.abs(this.graphPanBase.y - targetY) < 1) {
+        return;
+      }
+    }
+    this.graphPanBase = { x: targetX, y: targetY };
+    this.graphPanOffset = { x: 0, y: 0 };
+  }
+
   private resetGraphView(): void {
     this.graphZoom = 1;
     this.graphFocusedNoteId = '';
+    this.centerGraphViewport(true);
   }
 
   private toggleGraphFocus(noteId: string): void {
@@ -2253,6 +2270,7 @@ struct Index {
       .onClick(() => {
         this.compactPanel = value;
         if (value === 'graph') {
+          this.centerGraphViewport();
           this.initForceDirectedLayout();
         }
         if (value === 'library') {
@@ -2424,6 +2442,7 @@ struct Index {
     .onClick(() => {
       animateTo({ duration: 400, curve: Curve.Friction }, () => {
         this.activeVaultId = vault.id;
+        this.resetGraphView();
         const vaultNotes = this.getFilteredNotes();
         if (vaultNotes.length > 0) {
           this.activeNoteId = vaultNotes[0].id;
@@ -3286,7 +3305,20 @@ struct Index {
             };
             this.graphPanOffset = { x: 0, y: 0 };
           })
-      );
+      )
+      .onAreaChange((oldValue, newValue) => {
+        const nextWidth = Number(newValue.width);
+        const nextHeight = Number(newValue.height);
+        if (!(nextWidth > 0) || !(nextHeight > 0)) {
+          return;
+        }
+        const firstMeasure = this.graphViewportWidth <= 0 || this.graphViewportHeight <= 0;
+        this.graphViewportWidth = nextWidth;
+        this.graphViewportHeight = nextHeight;
+        if (firstMeasure) {
+          this.centerGraphViewport(true);
+        }
+      });
     }
     .padding(16)
     .backgroundColor(THEME.surfaceVariant)
